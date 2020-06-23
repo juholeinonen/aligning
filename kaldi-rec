@@ -206,7 +206,7 @@ def audio_file_len(audio_filename):
     audio_file_len = float(ms*1.0/1000.0)
     return audio_file_len
 
-def create_data_folder(target_wav_filename,seg_filenames):
+def create_data_folder(target_wav_filename,seg_filenames, transcript_file = None):
     file_path = ""
     file_id = ""
     if "/" in target_wav_filename:
@@ -246,7 +246,11 @@ def create_data_folder(target_wav_filename,seg_filenames):
     wav_list_file.close()
     
     #verbatim.ref
-    transcript = "NULL"
+    if transcript_file == None:
+        transcript = "NULL"
+    else:
+        with open(transcript_file, 'r') as tr_f:
+            transcript = tr_f.read().rstrip()
     verbatim_filename = kaldi_data_dir+"/verbatim.ref"
     verbatim_file = open(verbatim_filename,"w")
     for audio_filename in audio_filenames:
@@ -717,6 +721,15 @@ asr_models = {
              'lang':'Finnish',
              'default': True },
 
+    'align': { 'am-model': 'models/fi/all-lstm',
+             'ivec-extractor':'ivec/fi/all-lstm',
+             'decoding-graph':'models/fi/all-lstm/graph_conversational_assistant_word',
+             'decode-params':"--extra-left-context 40 --extra-right-context 0 --frames-per-chunk 140 --beam 20 --lattice-beam 10.0 --min-active 12000 --skip-scoring false --num-threads 4 --cmd 'slurm.pl --mem 8G' --post-decode-acwt 10.0 --acwt 1.0 --scoring-opts \"--min-lmwt 4 --max-lmwt 18 --decode_mbr true\" --online-ivector-dir",
+             'lattice-params':'--acoustic-scale=0.071428571',
+             'srate': 16000,
+             'frame-subsampling-factor' : 3,
+             'lang':'Finnish'},
+
     'fi-conversational': { 'am-model': 'models/fi/all-lstm',
              'ivec-extractor':'ivec/fi/all-lstm',
              'decoding-graph':'models/fi/all-lstm/suomi24',
@@ -746,6 +759,7 @@ def main():
     parser = argparse.ArgumentParser(description='Kaldi ASR')
 
     parser.add_argument('input', help='input, media filename (wav,mp4,avi,webm) or YouTube link',nargs=1)
+    parser.add_argument('--transcript',dest='transcript',type=str,help='The transcript of the audio',required=False)
     parser.add_argument('--eaf',dest='eaf_filename',type=str,help='Outputs recognition result as EAF file',required=False)
     parser.add_argument('--srt',dest='srt_filename',type=str,help='Outputs recognition result as SRT subtitle file',required=False)
     parser.add_argument('--txt',dest='txt_filename',type=str,help='Outputs recognition results as normal text file',required=False)
@@ -760,6 +774,12 @@ def main():
         wav_filename = os.path.realpath(args['input'][0])
     else:
         wav_filename = args['input'][0]
+
+    alignAudio = args['transcript'] != 'None' and isinstance(args['transcript'], basestring) and os.path.isfile(args['transcript'])
+    if alignAudio:
+        rootdir = '/scratch/work/jpleino1/taito/kaldi-asr/1.1/build/'
+        args['model'] = 'align'
+
     asr_model_name = args['model']
     asr_model = asr_models[asr_model_name]
     SOX_PATH = "sox"
@@ -777,8 +797,10 @@ def main():
     
     os.chdir(rootdir)
     #Segmentation and diarization
-
-    if args['diarization'] == 'None':
+    if alignAudio:
+        seg_audiofiles = [{ 'start': 0.0, 'file': target_wav_filename, 'speaker': 'NULL' }]
+        print(seg_audiofiles)
+    elif args['diarization'] == 'None':
         seg_audiofiles = split_audio(SOX_PATH,srate,target_wav_filename)
     elif args['diarization'] == 'LIUM':
         seg_audiofiles = LIUM_speaker_segment_audio(SOX_PATH,srate,target_wav_filename)
@@ -788,7 +810,10 @@ def main():
        
     
     #Prepare data folder
-    data_folder_path = create_data_folder(target_wav_filename,seg_audiofiles)
+    if alignAudio:
+        data_folder_path = create_data_folder(target_wav_filename,seg_audiofiles, os.path.join(original_cwd, args['transcript']))
+    else:
+        data_folder_path = create_data_folder(target_wav_filename,seg_audiofiles)
     number_of_speakers = num_of_speakers(seg_audiofiles)
     
     #Generate MFCC features and iVectors
@@ -801,10 +826,16 @@ def main():
     os.system(rootdir+"steps/compute_cmvn_stats.sh "+data_folder_path+" "+log_path+" "+cmvn_path)
     os.system(rootdir+"steps/online/nnet2/extract_ivectors_online.sh --nj "+str(number_of_speakers)+" "+data_folder_path+" "+IVEC_EXTRACTOR+" "+ivectors_dir)
 
-    #Recognize 
     decoding_output_path = data_folder_path+"/decode_output"
-    os.system(rootdir+"steps/nnet3/decode.sh --nj "+str(number_of_speakers)+" "+decode_params+" "+ivectors_dir+" "+DECODING_GRAPH+" "+data_folder_path+" "+decoding_output_path)
-    
+    if alignAudio:
+        aligning_model_folder = os.path.split(DECODING_GRAPH)[0]
+        aligning_output_path = data_folder_path + "/align_output"
+        os.system(rootdir+"steps/nnet3/align.sh --nj " + str(number_of_speakers) + " --use_gpu false --online_ivector_dir " + ivectors_dir + " " + data_folder_path + " " + DECODING_GRAPH + " " + aligning_model_folder + " " + aligning_output_path)
+        #sys.exit()
+    else:
+        #Recognize 
+        os.system(rootdir+"steps/nnet3/decode.sh --nj "+str(number_of_speakers)+" "+decode_params+" "+ivectors_dir+" "+DECODING_GRAPH+" "+data_folder_path+" "+decoding_output_path)
+        
     #Print output
     decode_output_filename = decoding_output_path+"/decode.output.txt"
     lattice_scale = "lattice-scale"
@@ -816,8 +847,12 @@ def main():
     
     #CTM output
     media_file_id = get_file_id(target_wav_filename)
-    ctm_filename = decoding_output_path+"/decode_"+media_file_id+".ctm"
-    os.system(lattice_1best+" "+lattice_params+" \"ark:gunzip -c \""+decoding_output_path+"/lat.*.gz\" |\" ark:- | "+lattice_align_words+" "+DECODING_GRAPH+"/phones/word_boundary.int "+AM_MODEL+"/final.mdl ark:- ark:- | "+nbest_to_ctm+"  ark:- "+ctm_filename)
+    if alignAudio:
+        ctm_filename = aligning_output_path+"/ctm"
+        os.system(rootdir+"steps/get_train_ctm.sh"+" "+data_folder_path+" "+DECODING_GRAPH+" "+aligning_output_path)
+    else:
+        ctm_filename = decoding_output_path+"/decode_"+media_file_id+".ctm"
+        os.system(lattice_1best+" "+lattice_params+" \"ark:gunzip -c \""+decoding_output_path+"/lat.*.gz\" |\" ark:- | "+lattice_align_words+" "+DECODING_GRAPH+"/phones/word_boundary.int "+AM_MODEL+"/final.mdl ark:- ark:- | "+nbest_to_ctm+"  ark:- "+ctm_filename)
     
     words_filename = DECODING_GRAPH+"/words.txt"
     
@@ -853,7 +888,10 @@ def main():
         start_offset = start_refs[seg_id]
         start_time = float(start)*FRAME_SUBSAMPLING_FACTOR+start_offset
         end_time = float(start)*FRAME_SUBSAMPLING_FACTOR+float(dur)+start_offset
-        token = words_dict[word_index]
+        if alignAudio:
+            token = word_index
+        else:
+            token = words_dict[word_index]
         speaker = speaker_refs[seg_id]
         #print str(start_time),str(end_time),token,speaker
         if (index != 0) and (current_seg_id != seg_id):
